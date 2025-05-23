@@ -35,6 +35,7 @@ import enum      NIOHTTP1.HTTPServerRequestPart
 import typealias NIOHTTP1.NIOHTTPServerUpgradeConfiguration
 import struct    NIOConcurrencyHelpers.NIOLock
 import Atomics
+import Foundation
 
 /**
  * http.Server
@@ -102,6 +103,7 @@ open class Server: ErrorEmitter, CustomStringConvertible {
     }
     return self
   }
+  
   @discardableResult
   open func listen(unixSocket : String = "express.socket",
                    backlog    : Int    = 256,
@@ -146,6 +148,53 @@ open class Server: ErrorEmitter, CustomStringConvertible {
             self.core.release(); self.didRetain = false
         }
       }
+  }
+
+  /**
+   * Stops the server from accepting new connections and closes all existing connections.
+   * Emits a 'close' event when the server has been completely closed.
+   *
+   * @return Self for easy chaining
+   */
+  @discardableResult
+  open func close(callback: ((Server) -> Void)? = nil) -> Self {
+    if let callback = callback {
+      onClose(execute: callback)
+    }
+    
+    lock.lock()
+    let channels = _channels
+    _channels.removeAll()
+    lock.unlock()
+    
+    if channels.isEmpty {
+      if didRetain {
+        core.release()
+        didRetain = false
+      }
+      emitClose()
+      return self
+    }
+    
+    let group = DispatchGroup()
+    
+    for channel in channels {
+      group.enter()
+      channel.close().whenComplete { _ in
+        group.leave()
+      }
+    }
+    
+    group.notify(queue: .global()) { [weak self] in
+      guard let self = self else { return }
+      if self.didRetain {
+        self.core.release()
+        self.didRetain = false
+      }
+      self.emitClose()
+    }
+    
+    return self
   }
 
   /**
@@ -203,6 +252,8 @@ open class Server: ErrorEmitter, CustomStringConvertible {
     EventListenerSet<( IncomingMessage, ServerResponse )>()
   private var _listeningListeners =
     EventListenerSet<Server>()
+  private var _closeListeners =
+    EventListenerSet<Server>()
 
   private var hasRequestListeners : Bool {
     lock.lock()
@@ -246,6 +297,21 @@ open class Server: ErrorEmitter, CustomStringConvertible {
     lock.unlock()
     if listening { execute(self) }
     return self
+  }
+
+  @discardableResult
+  public func onClose(execute: @escaping (Server) -> Void) -> Self {
+    lock.lock()
+    _closeListeners.add(execute)
+    lock.unlock()
+    return self
+  }
+
+  private func emitClose() {
+    lock.lock()
+    var listeners = _closeListeners
+    lock.unlock()
+    listeners.emit(self)
   }
 
   private func emitContinue(request: IncomingMessage, response: ServerResponse)
