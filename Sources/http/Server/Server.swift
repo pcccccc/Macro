@@ -149,52 +149,85 @@ open class Server: ErrorEmitter, CustomStringConvertible {
         }
       }
   }
-
-  /**
-   * Stops the server from accepting new connections and closes all existing connections.
-   * Emits a 'close' event when the server has been completely closed.
-   *
-   * @return Self for easy chaining
-   */
+  
   @discardableResult
-  open func close(callback: ((Server) -> Void)? = nil) -> Self {
-    if let callback = callback {
-      onClose(execute: callback)
-    }
-    
-    lock.lock()
-    let channels = _channels
-    _channels.removeAll()
-    lock.unlock()
-    
-    if channels.isEmpty {
-      if didRetain {
-        core.release()
-        didRetain = false
+  public func forceClose(callback: ((Server) -> Void)? = nil) -> Self {
+      if let callback = callback {
+          onClose(execute: callback)
       }
-      emitClose()
+      
+      // Use the lock to safely access and modify shared state
+      let channels = lock.withLock {
+          let currentChannels = _channels
+          _channels.removeAll()
+          return currentChannels
+      }
+      
+      // If no channels are open, release resources and emit close event
+      if channels.isEmpty {
+          if didRetain {
+              core.release()
+              didRetain = false
+          }
+          emitClose()
+          return self
+      }
+      
+      // Create a group to track when all channels are closed
+      let group = DispatchGroup()
+      // Track any errors that occur during channel closing
+      let errorLock = NIOLock()
+      var errors: [Error] = []
+      
+      // Close each channel and handle errors
+      for channel in channels {
+          group.enter()
+          channel.close().whenComplete { result in
+              switch result {
+              case .success:
+                  // Channel closed successfully
+                  break
+              case .failure(let error):
+                  // Log and store the error
+                  self.log.error("Error closing channel: \(error)")
+                  errorLock.withLock {
+                      errors.append(error)
+                  }
+              }
+              group.leave()
+          }
+      }
+      
+      // Once all channels are closed, release resources and emit close event
+      group.notify(queue: .global()) { [weak self] in
+          guard let self = self else { return }
+          
+          // Check if there were any errors
+          let finalError: Error? = errorLock.withLock {
+              return errors.first
+          }
+          
+          // If there were errors, emit them
+          if let error = finalError {
+              self.emit(error: error)
+          }
+          
+          // Release resources
+          if self.didRetain {
+              self.core.release()
+              self.didRetain = false
+          }
+          
+          // Emit the close event
+          self.emitClose()
+          
+          // Call the callback if provided
+          if let callback = callback {
+              callback(self)
+          }
+      }
+      
       return self
-    }
-    
-    let group = DispatchGroup()
-    
-    for channel in channels {
-      group.enter()
-      channel.close().whenComplete { _ in
-        group.leave()
-      }
-    }
-    
-    group.notify(queue: .global()) { [weak self] in
-      guard let self = self else { return }
-      if self.didRetain {
-        self.core.release()
-        self.didRetain = false
-      }
-      self.emitClose()
-    }
-    
-    return self
   }
 
   /**
